@@ -584,6 +584,9 @@ class OPDTrainer(BaseTrainer):
                 sample_kwargs = {
                     **self.training_args,
                     "compute_log_prob": False,
+                    # Pure OPD does not consume decoded media; keep decode only when
+                    # reward models need image/video tensors during prepare_feedback().
+                    "decode_media": self.enable_reward_weighting,
                     "trajectory_indices": trajectory_indices,
                     **batch,
                 }

@@ -105,9 +105,9 @@ train:
   group_size: 1
   global_std: false
   advantage_aggregation: "gdpo"
-  unique_sample_num_per_epoch: 16
-  gradient_step_per_epoch: 1
-  gradient_accumulation_steps: 1
+  unique_sample_num_per_epoch: 576
+  gradient_step_per_epoch: 16
+  gradient_accumulation_steps: auto
 
   # Optimization
   seed: 42

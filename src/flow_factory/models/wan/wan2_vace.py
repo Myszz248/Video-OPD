@@ -447,6 +447,7 @@ class Wan2_VACE_Adapter(BaseAdapter):
         max_sequence_length: int = 512,
         extra_call_back_kwargs: List[str] = [],
         trajectory_indices: TrajectoryIndicesType = "all",
+        decode_media: bool = True,
     ) -> List[WanVACESample]:
         """Generate VACE text-to-video samples and store replay conditioning."""
         device = self.device
@@ -587,7 +588,7 @@ class Wan2_VACE_Adapter(BaseAdapter):
             )
 
         self.pipeline._current_timestep = None
-        decoded_videos = self.decode_latents(latents, output_type="pt")
+        decoded_videos = self.decode_latents(latents, output_type="pt") if decode_media else None
         extra_call_back_res = callback_collector.get_result()
         callback_index_map = callback_collector.get_index_map()
         all_latents = latent_collector.get_result()
@@ -610,7 +611,7 @@ class Wan2_VACE_Adapter(BaseAdapter):
                 ),
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
-                video=decoded_videos[b],
+                video=decoded_videos[b] if decoded_videos is not None else None,
                 height=height,
                 width=width,
                 prompt=prompt[b] if isinstance(prompt, list) else prompt,

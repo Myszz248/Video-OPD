@@ -257,6 +257,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         # Extra callback arguments
         extra_call_back_kwargs: List[str] = [],
         trajectory_indices: TrajectoryIndicesType = 'all',
+        decode_media: bool = True,
     ) -> List[WanT2VSample]:
         # 1. Setup args
         device = self.device
@@ -379,8 +380,8 @@ class Wan2_T2V_Adapter(BaseAdapter):
 
         self.pipeline._current_timestep = None
 
-        # 7. Decode latents to videos (list of pil images)
-        decoded_videos = self.decode_latents(latents, output_type='pt')
+        # 7. Decode final latents only when downstream consumers need media tensors.
+        decoded_videos = self.decode_latents(latents, output_type='pt') if decode_media else None
 
         # 8. Prepare output samples
         extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
@@ -398,7 +399,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Generated video & metadata
-                video=decoded_videos[b],
+                video=decoded_videos[b] if decoded_videos is not None else None,
                 height=height,
                 width=width,
                 # Prompt info
