@@ -60,20 +60,27 @@ class OPDTeacher:
         )
 
     def prepare(self) -> None:
-        """Freeze teacher parameters, move runtime components to device, and validate forward."""
+        """Freeze teacher parameters and validate forward-time requirements."""
         for component_name in self.adapter._resolve_component_names(None):
             component = self.adapter.get_component(component_name)
             if component is not None and hasattr(component, "requires_grad_"):
                 component.requires_grad_(False)
                 component.eval()
 
+        self.adapter.eval()
+        self._validate_forward_signature()
+        self._validate_media_context_support()
+
+    def on_load_runtime_components(self) -> None:
+        """Load teacher runtime components onto the configured teacher device."""
         self.adapter.on_load_components(
             components=self.teacher_args.runtime_components,
             device=self.teacher_args.device,
         )
-        self.adapter.eval()
-        self._validate_forward_signature()
-        self._validate_media_context_support()
+
+    def off_load_runtime_components(self) -> None:
+        """Offload teacher runtime components back to CPU."""
+        self.adapter.off_load_components(self.teacher_args.runtime_components)
 
     def _validate_forward_signature(self) -> None:
         """Fail fast when a teacher forward requires unsupported non-text inputs."""
@@ -493,107 +500,111 @@ class OPDTeacher:
         if not samples:
             return []
 
-        self.adapter.eval()
-        resumed_samples: List[T2VSample] = []
+        self.on_load_runtime_components()
+        try:
+            self.adapter.eval()
+            resumed_samples: List[T2VSample] = []
 
-        with torch.no_grad():
-            for sample in samples:
-                if sample.prompt is None:
-                    raise ValueError("Teacher resume debug requires every sample to have `prompt`.")
-                if sample.timesteps is None or sample.all_latents is None or sample.latent_index_map is None:
-                    raise ValueError(
-                        "Teacher resume debug requires `timesteps`, `all_latents`, and "
-                        "`latent_index_map` on every sample."
-                    )
-
-                timesteps = sample.timesteps.to(self.teacher_args.device)
-                if timesteps.ndim != 1:
-                    raise ValueError(
-                        "Teacher resume debug expects per-sample 1D `timesteps`, got "
-                        f"{tuple(timesteps.shape)}."
-                    )
-                resume_step_idx = self._normalize_resume_step_index(
-                    step_idx=step_idx,
-                    num_inference_steps=int(timesteps.shape[0]),
-                )
-                latent_index_map = sample.latent_index_map.to(device=self.teacher_args.device)
-                compact_idx = int(latent_index_map[resume_step_idx].item())
-                if compact_idx < 0:
-                    raise ValueError(
-                        "Requested teacher resume step was not stored in the student trajectory: "
-                        f"step_idx({resume_step_idx}), "
-                        f"latent_index_map={latent_index_map.detach().cpu().tolist()}."
-                    )
-
-                current_latents = sample.all_latents[compact_idx].unsqueeze(0).to(
-                    self.teacher_args.device
-                )
-                context = sample.extra_kwargs.get("opd_context", "{}")
-                prompts = [sample.prompt]
-                negative_prompts = None
-                if sample.negative_prompt is not None:
-                    negative_prompts = [sample.negative_prompt]
-
-                teacher_prompts = self.context_builder.build_prompts(
-                    prompts=prompts,
-                    contexts=[context],
-                )
-                encoded_prompt = self.encode_prompt(
-                    prompts=prompts,
-                    contexts=[context],
-                    negative_prompts=negative_prompts,
-                )
-                media_forward_kwargs = self.prepare_media_forward_kwargs(
-                    contexts=[context],
-                    latents=current_latents,
-                    generator=None,
-                )
-                self._validate_resume_timesteps(timesteps)
-
-                for idx in range(resume_step_idx, int(timesteps.shape[0])):
-                    t = timesteps[idx].view(1)
-                    t_next = (
-                        timesteps[idx + 1].view(1)
-                        if idx + 1 < timesteps.shape[0]
-                        else torch.zeros_like(t)
-                    )
-                    negative_prompt_embeds = encoded_prompt.get("negative_prompt_embeds")
-                    if negative_prompt_embeds is not None:
-                        negative_prompt_embeds = negative_prompt_embeds.to(
-                            device=current_latents.device
+            with torch.no_grad():
+                for sample in samples:
+                    if sample.prompt is None:
+                        raise ValueError("Teacher resume debug requires every sample to have `prompt`.")
+                    if sample.timesteps is None or sample.all_latents is None or sample.latent_index_map is None:
+                        raise ValueError(
+                            "Teacher resume debug requires `timesteps`, `all_latents`, and "
+                            "`latent_index_map` on every sample."
                         )
-                    forward_kwargs = {
-                        "t": t,
-                        "t_next": t_next,
-                        "latents": current_latents,
-                        "prompt_embeds": encoded_prompt["prompt_embeds"].to(
-                            device=current_latents.device
-                        ),
-                        "negative_prompt_embeds": negative_prompt_embeds,
-                        "guidance_scale": self.training_args.teacher_guidance_scale,
-                        "compute_log_prob": False,
-                        "return_kwargs": ["next_latents"],
-                        "noise_level": self.adapter.scheduler.get_noise_level_for_timestep(t),
-                        **media_forward_kwargs,
-                    }
-                    forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
-                    output = self.adapter.forward(**forward_kwargs)
-                    current_latents = self.adapter.cast_latents(output.next_latents)
 
-                decoded_video = self.adapter.decode_latents(current_latents, output_type="pt")[0]
-                resumed_samples.append(
-                    T2VSample(
-                        video=decoded_video,
-                        height=sample.height,
-                        width=sample.width,
-                        prompt=f"[teacher resume step {resume_step_idx}] {sample.prompt}",
-                        negative_prompt=sample.negative_prompt,
-                        extra_kwargs={
-                            "teacher_prompt": teacher_prompts[0],
-                            "resume_step_idx": resume_step_idx,
-                            "resume_timestep": float(timesteps[resume_step_idx].item()),
-                        },
+                    timesteps = sample.timesteps.to(self.teacher_args.device)
+                    if timesteps.ndim != 1:
+                        raise ValueError(
+                            "Teacher resume debug expects per-sample 1D `timesteps`, got "
+                            f"{tuple(timesteps.shape)}."
+                        )
+                    resume_step_idx = self._normalize_resume_step_index(
+                        step_idx=step_idx,
+                        num_inference_steps=int(timesteps.shape[0]),
                     )
-                )
+                    latent_index_map = sample.latent_index_map.to(device=self.teacher_args.device)
+                    compact_idx = int(latent_index_map[resume_step_idx].item())
+                    if compact_idx < 0:
+                        raise ValueError(
+                            "Requested teacher resume step was not stored in the student trajectory: "
+                            f"step_idx({resume_step_idx}), "
+                            f"latent_index_map={latent_index_map.detach().cpu().tolist()}."
+                        )
 
-        return resumed_samples
+                    current_latents = sample.all_latents[compact_idx].unsqueeze(0).to(
+                        self.teacher_args.device
+                    )
+                    context = sample.extra_kwargs.get("opd_context", "{}")
+                    prompts = [sample.prompt]
+                    negative_prompts = None
+                    if sample.negative_prompt is not None:
+                        negative_prompts = [sample.negative_prompt]
+
+                    teacher_prompts = self.context_builder.build_prompts(
+                        prompts=prompts,
+                        contexts=[context],
+                    )
+                    encoded_prompt = self.encode_prompt(
+                        prompts=prompts,
+                        contexts=[context],
+                        negative_prompts=negative_prompts,
+                    )
+                    media_forward_kwargs = self.prepare_media_forward_kwargs(
+                        contexts=[context],
+                        latents=current_latents,
+                        generator=None,
+                    )
+                    self._validate_resume_timesteps(timesteps)
+
+                    for idx in range(resume_step_idx, int(timesteps.shape[0])):
+                        t = timesteps[idx].view(1)
+                        t_next = (
+                            timesteps[idx + 1].view(1)
+                            if idx + 1 < timesteps.shape[0]
+                            else torch.zeros_like(t)
+                        )
+                        negative_prompt_embeds = encoded_prompt.get("negative_prompt_embeds")
+                        if negative_prompt_embeds is not None:
+                            negative_prompt_embeds = negative_prompt_embeds.to(
+                                device=current_latents.device
+                            )
+                        forward_kwargs = {
+                            "t": t,
+                            "t_next": t_next,
+                            "latents": current_latents,
+                            "prompt_embeds": encoded_prompt["prompt_embeds"].to(
+                                device=current_latents.device
+                            ),
+                            "negative_prompt_embeds": negative_prompt_embeds,
+                            "guidance_scale": self.training_args.teacher_guidance_scale,
+                            "compute_log_prob": False,
+                            "return_kwargs": ["next_latents"],
+                            "noise_level": self.adapter.scheduler.get_noise_level_for_timestep(t),
+                            **media_forward_kwargs,
+                        }
+                        forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
+                        output = self.adapter.forward(**forward_kwargs)
+                        current_latents = self.adapter.cast_latents(output.next_latents)
+
+                    decoded_video = self.adapter.decode_latents(current_latents, output_type="pt")[0]
+                    resumed_samples.append(
+                        T2VSample(
+                            video=decoded_video,
+                            height=sample.height,
+                            width=sample.width,
+                            prompt=f"[teacher resume step {resume_step_idx}] {sample.prompt}",
+                            negative_prompt=sample.negative_prompt,
+                            extra_kwargs={
+                                "teacher_prompt": teacher_prompts[0],
+                                "resume_step_idx": resume_step_idx,
+                                "resume_timestep": float(timesteps[resume_step_idx].item()),
+                            },
+                        )
+                    )
+
+            return resumed_samples
+        finally:
+            self.off_load_runtime_components()

@@ -63,6 +63,7 @@ class OPDTrainer(BaseTrainer):
         self._validate_loss_weighting_config()
         self.teacher = load_opd_teacher(self.config, self.accelerator)
         self._validate_teacher_blend_config()
+        self._offload_student_vae()
 
     @property
     def enable_reward_weighting(self) -> bool:
@@ -83,6 +84,16 @@ class OPDTrainer(BaseTrainer):
     def use_teacher_student_latent_blend(self) -> bool:
         """Return whether teacher supervision should use blended teacher/student latents."""
         return self.training_args.opd_blend_teacher_student_latents
+
+    def _load_student_vae(self) -> None:
+        """Load the student VAE for rollout/evaluation stages that need it."""
+        if "vae" in self.adapter._resolve_component_names(None):
+            self.adapter.on_load_vae(self.accelerator.device)
+
+    def _offload_student_vae(self) -> None:
+        """Offload the student VAE outside rollout/evaluation stages."""
+        if "vae" in self.adapter._resolve_component_names(None):
+            self.adapter.off_load_vae()
 
     def _validate_teacher_blend_config(self) -> None:
         """Validate optional teacher-first-step latent blending requirements."""
@@ -477,52 +488,56 @@ class OPDTrainer(BaseTrainer):
         if self.test_dataloader is None:
             return
 
-        self.adapter.eval()
-        self.eval_reward_buffer.clear()
+        self._load_student_vae()
+        try:
+            self.adapter.eval()
+            self.eval_reward_buffer.clear()
 
-        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
-            all_samples: List[BaseSample] = []
-            for batch in tqdm(
-                self.test_dataloader,
-                desc="Evaluating",
-                disable=not self.show_progress_bar,
-            ):
-                generator = create_generator_by_prompt(batch["prompt"], self.training_args.seed)
-                inference_kwargs = {
-                    "compute_log_prob": False,
-                    "generator": generator,
-                    "trajectory_indices": None,
-                    **self.eval_args,
+            with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
+                all_samples: List[BaseSample] = []
+                for batch in tqdm(
+                    self.test_dataloader,
+                    desc="Evaluating",
+                    disable=not self.show_progress_bar,
+                ):
+                    generator = create_generator_by_prompt(batch["prompt"], self.training_args.seed)
+                    inference_kwargs = {
+                        "compute_log_prob": False,
+                        "generator": generator,
+                        "trajectory_indices": None,
+                        **self.eval_args,
+                    }
+                    inference_kwargs.update(**batch)
+                    inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
+                    samples = self.adapter.inference(**inference_kwargs)
+                    all_samples.extend(samples)
+                    self.eval_reward_buffer.add_samples(samples)
+
+                rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split="pointwise")
+                rewards = {
+                    key: torch.as_tensor(value).to(self.accelerator.device)
+                    for key, value in rewards.items()
                 }
-                inference_kwargs.update(**batch)
-                inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
-                samples = self.adapter.inference(**inference_kwargs)
-                all_samples.extend(samples)
-                self.eval_reward_buffer.add_samples(samples)
-
-            rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split="pointwise")
-            rewards = {
-                key: torch.as_tensor(value).to(self.accelerator.device)
-                for key, value in rewards.items()
-            }
-            gathered_rewards = {
-                key: self.accelerator.gather(value).cpu().numpy() for key, value in rewards.items()
-            }
-
-            if self.accelerator.is_main_process:
-                log_data = {
-                    f"eval/reward_{key}_mean": np.mean(value)
-                    for key, value in gathered_rewards.items()
+                gathered_rewards = {
+                    key: self.accelerator.gather(value).cpu().numpy() for key, value in rewards.items()
                 }
-                log_data.update(
-                    {
-                        f"eval/reward_{key}_std": np.std(value)
+
+                if self.accelerator.is_main_process:
+                    log_data = {
+                        f"eval/reward_{key}_mean": np.mean(value)
                         for key, value in gathered_rewards.items()
                     }
-                )
-                log_data["eval_samples"] = all_samples
-                self.log_data(log_data, step=self.step)
-            self.accelerator.wait_for_everyone()
+                    log_data.update(
+                        {
+                            f"eval/reward_{key}_std": np.std(value)
+                            for key, value in gathered_rewards.items()
+                        }
+                    )
+                    log_data["eval_samples"] = all_samples
+                    self.log_data(log_data, step=self.step)
+                self.accelerator.wait_for_everyone()
+        finally:
+            self._offload_student_vae()
 
     def start(self):
         """Run the OPD six-stage training loop."""
@@ -562,51 +577,59 @@ class OPDTrainer(BaseTrainer):
 
     def sample(self) -> List[BaseSample]:
         """Generate student rollouts and keep OPD-required trajectory states."""
-        self.adapter.rollout()
-        self.reward_buffer.clear()
-        samples = []
-        data_iter = iter(self.dataloader)
-        trajectory_step_indices = None
-        if self.use_trajectory_timesteps:
-            trajectory_step_indices = self._resolve_trajectory_step_indices()
-            self._validate_flow_opd_supervised_steps(trajectory_step_indices)
-            trajectory_indices = trajectory_step_indices.detach().cpu().tolist()
-        else:
-            trajectory_indices = [-1]
+        self._load_student_vae()
+        if self.use_teacher_student_latent_blend:
+            self.teacher.on_load_runtime_components()
+        try:
+            self.adapter.rollout()
+            self.reward_buffer.clear()
+            samples = []
+            data_iter = iter(self.dataloader)
+            trajectory_step_indices = None
+            if self.use_trajectory_timesteps:
+                trajectory_step_indices = self._resolve_trajectory_step_indices()
+                self._validate_flow_opd_supervised_steps(trajectory_step_indices)
+                trajectory_indices = trajectory_step_indices.detach().cpu().tolist()
+            else:
+                trajectory_indices = [-1]
 
-        with torch.no_grad(), self.autocast():
-            for batch_idx in tqdm(
-                range(self.training_args.num_batches_per_epoch),
-                desc=f"Epoch {self.epoch} Sampling",
-                disable=not self.show_progress_bar,
-            ):
-                batch = next(data_iter)
-                sample_kwargs = {
-                    **self.training_args,
-                    "compute_log_prob": False,
-                    # Pure OPD does not consume decoded media; keep decode only when
-                    # reward models need image/video tensors during prepare_feedback().
-                    "decode_media": self.enable_reward_weighting,
-                    "trajectory_indices": trajectory_indices,
-                    **batch,
-                }
-                sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                sample_batch = self.adapter.inference(**sample_kwargs)
-                self._attach_opd_context(sample_batch, batch)
-                teacher_first_step_gen = create_generator(
-                    self.training_args.seed,
-                    self.epoch,
-                    batch_idx,
-                )
-                self._attach_teacher_first_step_latents(
-                    sample_batch,
-                    generator=teacher_first_step_gen,
-                )
-                self._attach_opd_step_indices(sample_batch, trajectory_step_indices)
-                self._maybe_offload_samples_to_cpu(sample_batch)
-                samples.extend(sample_batch)
-                self.reward_buffer.add_samples(sample_batch)
-        return samples
+            with torch.no_grad(), self.autocast():
+                for batch_idx in tqdm(
+                    range(self.training_args.num_batches_per_epoch),
+                    desc=f"Epoch {self.epoch} Sampling",
+                    disable=not self.show_progress_bar,
+                ):
+                    batch = next(data_iter)
+                    sample_kwargs = {
+                        **self.training_args,
+                        "compute_log_prob": False,
+                        # Pure OPD does not consume decoded media; keep decode only when
+                        # reward models need image/video tensors during prepare_feedback().
+                        "decode_media": self.enable_reward_weighting,
+                        "trajectory_indices": trajectory_indices,
+                        **batch,
+                    }
+                    sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
+                    sample_batch = self.adapter.inference(**sample_kwargs)
+                    self._attach_opd_context(sample_batch, batch)
+                    teacher_first_step_gen = create_generator(
+                        self.training_args.seed,
+                        self.epoch,
+                        batch_idx,
+                    )
+                    self._attach_teacher_first_step_latents(
+                        sample_batch,
+                        generator=teacher_first_step_gen,
+                    )
+                    self._attach_opd_step_indices(sample_batch, trajectory_step_indices)
+                    self._maybe_offload_samples_to_cpu(sample_batch)
+                    samples.extend(sample_batch)
+                    self.reward_buffer.add_samples(sample_batch)
+            return samples
+        finally:
+            if self.use_teacher_student_latent_blend:
+                self.teacher.off_load_runtime_components()
+            self._offload_student_vae()
 
     def compute_advantages(
         self,
@@ -839,179 +862,183 @@ class OPDTrainer(BaseTrainer):
 
     def optimize(self, samples: List[BaseSample]) -> None:
         """Optimize student with teacher velocity matching on OPD timesteps."""
-        device = self.accelerator.device
-        per_device_batch_size = self.training_args.per_device_batch_size
-        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
+        self.teacher.on_load_runtime_components()
+        try:
+            device = self.accelerator.device
+            per_device_batch_size = self.training_args.per_device_batch_size
+            num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
 
-        for inner_epoch in range(self.training_args.num_inner_epochs):
-            perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
-            perm = torch.randperm(len(samples), generator=perm_gen)
-            shuffled_samples = [samples[i] for i in perm]
-            loss_info = defaultdict(list)
+            for inner_epoch in range(self.training_args.num_inner_epochs):
+                perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
+                perm = torch.randperm(len(samples), generator=perm_gen)
+                shuffled_samples = [samples[i] for i in perm]
+                loss_info = defaultdict(list)
 
-            for batch_idx in tqdm(
-                range(num_batches),
-                total=num_batches,
-                desc=f"Epoch {self.epoch} Training",
-                position=0,
-                disable=not self.show_progress_bar,
-            ):
-                start = batch_idx * per_device_batch_size
-                batch_samples = [
-                    sample.to(device)
-                    for sample in shuffled_samples[start : start + per_device_batch_size]
-                ]
-                batch = BaseSample.stack(batch_samples)
-                batch_size = batch["all_latents"].shape[0]
-                contexts = batch.get("opd_context", ["{}"] * batch_size)
-                teacher_context_gen = create_generator(
-                    self.training_args.seed,
-                    self.epoch,
-                    inner_epoch,
-                    batch_idx,
-                )
-                with torch.no_grad():
-                    teacher_encoded = self.teacher.encode_prompt(
-                        prompts=batch["prompt"],
-                        contexts=contexts,
-                        negative_prompts=batch.get("negative_prompt"),
-                        generator=teacher_context_gen,
+                for batch_idx in tqdm(
+                    range(num_batches),
+                    total=num_batches,
+                    desc=f"Epoch {self.epoch} Training",
+                    position=0,
+                    disable=not self.show_progress_bar,
+                ):
+                    start = batch_idx * per_device_batch_size
+                    batch_samples = [
+                        sample.to(device)
+                        for sample in shuffled_samples[start : start + per_device_batch_size]
+                    ]
+                    batch = BaseSample.stack(batch_samples)
+                    batch_size = batch["all_latents"].shape[0]
+                    contexts = batch.get("opd_context", ["{}"] * batch_size)
+                    teacher_context_gen = create_generator(
+                        self.training_args.seed,
+                        self.epoch,
+                        inner_epoch,
+                        batch_idx,
                     )
+                    with torch.no_grad():
+                        teacher_encoded = self.teacher.encode_prompt(
+                            prompts=batch["prompt"],
+                            contexts=contexts,
+                            negative_prompts=batch.get("negative_prompt"),
+                            generator=teacher_context_gen,
+                        )
 
-                self.adapter.train()
-                if self.use_trajectory_timesteps:
-                    trajectory_step_indices = self._get_batch_trajectory_step_indices(batch, device)
-                    num_timestep_updates = int(trajectory_step_indices.numel())
-                    teacher_first_step_latents = (
-                        self._get_teacher_first_step_latents(batch, device)
-                        if self.use_teacher_student_latent_blend
-                        else None
+                    self.adapter.train()
+                    if self.use_trajectory_timesteps:
+                        trajectory_step_indices = self._get_batch_trajectory_step_indices(batch, device)
+                        num_timestep_updates = int(trajectory_step_indices.numel())
+                        teacher_first_step_latents = (
+                            self._get_teacher_first_step_latents(batch, device)
+                            if self.use_teacher_student_latent_blend
+                            else None
+                        )
+                        all_timesteps = None
+                        clean_latents = None
+                    else:
+                        trajectory_step_indices = None
+                        teacher_first_step_latents = None
+                        num_timestep_updates = self.num_train_timesteps
+                        all_timesteps = self._sample_timesteps(batch_size)
+                        clean_latents = batch["all_latents"][:, -1]
+
+                    media_reference_latents = (
+                        batch["all_latents"][:, 0] if self.use_trajectory_timesteps else clean_latents
                     )
-                    all_timesteps = None
-                    clean_latents = None
-                else:
-                    trajectory_step_indices = None
-                    teacher_first_step_latents = None
-                    num_timestep_updates = self.num_train_timesteps
-                    all_timesteps = self._sample_timesteps(batch_size)
-                    clean_latents = batch["all_latents"][:, -1]
+                    with torch.no_grad():
+                        teacher_media_kwargs = self.teacher.prepare_media_forward_kwargs(
+                            contexts=contexts,
+                            latents=media_reference_latents,
+                            generator=teacher_context_gen,
+                        )
 
-                media_reference_latents = (
-                    batch["all_latents"][:, 0] if self.use_trajectory_timesteps else clean_latents
-                )
-                with torch.no_grad():
-                    teacher_media_kwargs = self.teacher.prepare_media_forward_kwargs(
-                        contexts=contexts,
-                        latents=media_reference_latents,
-                        generator=teacher_context_gen,
-                    )
-
-                with self.autocast():
-                    for t_idx in tqdm(
-                        range(num_timestep_updates),
-                        desc=f"Epoch {self.epoch} Timestep",
-                        position=1,
-                        leave=False,
-                        disable=not self.show_progress_bar,
-                    ):
-                        with self.accelerator.accumulate(*self.adapter.trainable_components):
-                            if self.use_trajectory_timesteps:
-                                step_idx = int(trajectory_step_indices[t_idx].item())
-                                noised_latents, t_flat, t_next = self._get_trajectory_step_inputs(
-                                    batch=batch,
-                                    step_idx=step_idx,
-                                    batch_size=batch_size,
-                                    device=device,
-                                )
-                            else:
-                                t_flat = all_timesteps[t_idx]
-                                t_next = torch.zeros_like(t_flat)
-                                sigma = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
-                                noise = randn_tensor(
-                                    clean_latents.shape,
-                                    device=clean_latents.device,
-                                    dtype=clean_latents.dtype,
-                                )
-                                noised_latents = (1 - sigma) * clean_latents + sigma * noise
-
-                            student_v_pred = self._compute_student_output(
-                                batch=batch,
-                                timestep=t_flat,
-                                latents=noised_latents,
-                                t_next=t_next,
-                            )
-                            teacher_input_latents = noised_latents
-                            if teacher_first_step_latents is not None:
-                                teacher_input_latents = self._blend_teacher_and_student_latents(
-                                    student_latents=noised_latents,
-                                    teacher_first_step_latents=teacher_first_step_latents,
-                                )
-                            with torch.no_grad():
-                                teacher_v_pred = self.teacher.forward_velocity(
-                                    batch=batch,
-                                    contexts=contexts,
-                                    latents=teacher_input_latents,
-                                    timestep=t_flat,
-                                    t_next=t_next,
-                                    encoded_prompt=teacher_encoded,
-                                    media_forward_kwargs=teacher_media_kwargs,
-                                )
-
-                            timestep_weight = self._get_opd_timestep_weight(t_flat, t_next)
-                            if timestep_weight is not None:
-                                loss_info["opd_time_weight"].append(timestep_weight.detach())
-                            per_sample_loss = self._compute_opd_loss(
-                                student_v_pred=student_v_pred,
-                                teacher_v_pred=teacher_v_pred.detach(),
-                                noised_latents=noised_latents,
-                                timestep=t_flat,
-                                timestep_weight=timestep_weight,
-                            )
-                            weighted_loss = self._apply_reward_weighting(
-                                per_sample_loss=per_sample_loss,
-                                batch=batch,
-                                loss_info=loss_info,
-                            )
-                            opd_loss = self.training_args.opd_teacher_weight * weighted_loss.mean()
-                            loss = opd_loss
-
-                            if self.enable_kl_loss:
-                                with torch.no_grad(), self.adapter.use_ref_parameters():
-                                    ref_v_pred = self._compute_student_output(
+                    with self.autocast():
+                        for t_idx in tqdm(
+                            range(num_timestep_updates),
+                            desc=f"Epoch {self.epoch} Timestep",
+                            position=1,
+                            leave=False,
+                            disable=not self.show_progress_bar,
+                        ):
+                            with self.accelerator.accumulate(*self.adapter.trainable_components):
+                                if self.use_trajectory_timesteps:
+                                    step_idx = int(trajectory_step_indices[t_idx].item())
+                                    noised_latents, t_flat, t_next = self._get_trajectory_step_inputs(
                                         batch=batch,
-                                        timestep=t_flat,
-                                        latents=noised_latents,
-                                        t_next=t_next,
+                                        step_idx=step_idx,
+                                        batch_size=batch_size,
+                                        device=device,
                                     )
-                                kl_div = F.mse_loss(
-                                    student_v_pred.float(),
-                                    ref_v_pred.float(),
-                                    reduction="none",
-                                ).mean(dim=tuple(range(1, student_v_pred.ndim)))
+                                else:
+                                    t_flat = all_timesteps[t_idx]
+                                    t_next = torch.zeros_like(t_flat)
+                                    sigma = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
+                                    noise = randn_tensor(
+                                        clean_latents.shape,
+                                        device=clean_latents.device,
+                                        dtype=clean_latents.dtype,
+                                    )
+                                    noised_latents = (1 - sigma) * clean_latents + sigma * noise
+
+                                student_v_pred = self._compute_student_output(
+                                    batch=batch,
+                                    timestep=t_flat,
+                                    latents=noised_latents,
+                                    t_next=t_next,
+                                )
+                                teacher_input_latents = noised_latents
+                                if teacher_first_step_latents is not None:
+                                    teacher_input_latents = self._blend_teacher_and_student_latents(
+                                        student_latents=noised_latents,
+                                        teacher_first_step_latents=teacher_first_step_latents,
+                                    )
+                                with torch.no_grad():
+                                    teacher_v_pred = self.teacher.forward_velocity(
+                                        batch=batch,
+                                        contexts=contexts,
+                                        latents=teacher_input_latents,
+                                        timestep=t_flat,
+                                        t_next=t_next,
+                                        encoded_prompt=teacher_encoded,
+                                        media_forward_kwargs=teacher_media_kwargs,
+                                    )
+
+                                timestep_weight = self._get_opd_timestep_weight(t_flat, t_next)
                                 if timestep_weight is not None:
-                                    kl_div = kl_div * timestep_weight.to(kl_div.device)
-                                kl_loss = self.training_args.opd_kl_beta * kl_div.mean()
-                                loss = loss + kl_loss
-                                loss_info["kl_div"].append(kl_div.detach())
-                                loss_info["kl_loss"].append(kl_loss.detach())
-
-                            loss_info["opd_loss"].append(opd_loss.detach())
-                            loss_info["unweighted_opd_loss"].append(per_sample_loss.detach())
-                            loss_info["loss"].append(loss.detach())
-
-                            self.accelerator.backward(loss)
-                            if self.accelerator.sync_gradients:
-                                grad_norm = self.accelerator.clip_grad_norm_(
-                                    self.adapter.get_trainable_parameters(),
-                                    self.training_args.max_grad_norm,
+                                    loss_info["opd_time_weight"].append(timestep_weight.detach())
+                                per_sample_loss = self._compute_opd_loss(
+                                    student_v_pred=student_v_pred,
+                                    teacher_v_pred=teacher_v_pred.detach(),
+                                    noised_latents=noised_latents,
+                                    timestep=t_flat,
+                                    timestep_weight=timestep_weight,
                                 )
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-                                loss_info = reduce_loss_info(self.accelerator, loss_info)
-                                loss_info["grad_norm"] = grad_norm
-                                self.log_data(
-                                    {f"train/{k}": v for k, v in loss_info.items()},
-                                    step=self.step,
+                                weighted_loss = self._apply_reward_weighting(
+                                    per_sample_loss=per_sample_loss,
+                                    batch=batch,
+                                    loss_info=loss_info,
                                 )
-                                self.step += 1
-                                loss_info = defaultdict(list)
+                                opd_loss = self.training_args.opd_teacher_weight * weighted_loss.mean()
+                                loss = opd_loss
+
+                                if self.enable_kl_loss:
+                                    with torch.no_grad(), self.adapter.use_ref_parameters():
+                                        ref_v_pred = self._compute_student_output(
+                                            batch=batch,
+                                            timestep=t_flat,
+                                            latents=noised_latents,
+                                            t_next=t_next,
+                                        )
+                                    kl_div = F.mse_loss(
+                                        student_v_pred.float(),
+                                        ref_v_pred.float(),
+                                        reduction="none",
+                                    ).mean(dim=tuple(range(1, student_v_pred.ndim)))
+                                    if timestep_weight is not None:
+                                        kl_div = kl_div * timestep_weight.to(kl_div.device)
+                                    kl_loss = self.training_args.opd_kl_beta * kl_div.mean()
+                                    loss = loss + kl_loss
+                                    loss_info["kl_div"].append(kl_div.detach())
+                                    loss_info["kl_loss"].append(kl_loss.detach())
+
+                                loss_info["opd_loss"].append(opd_loss.detach())
+                                loss_info["unweighted_opd_loss"].append(per_sample_loss.detach())
+                                loss_info["loss"].append(loss.detach())
+
+                                self.accelerator.backward(loss)
+                                if self.accelerator.sync_gradients:
+                                    grad_norm = self.accelerator.clip_grad_norm_(
+                                        self.adapter.get_trainable_parameters(),
+                                        self.training_args.max_grad_norm,
+                                    )
+                                    self.optimizer.step()
+                                    self.optimizer.zero_grad()
+                                    loss_info = reduce_loss_info(self.accelerator, loss_info)
+                                    loss_info["grad_norm"] = grad_norm
+                                    self.log_data(
+                                        {f"train/{k}": v for k, v in loss_info.items()},
+                                        step=self.step,
+                                    )
+                                    self.step += 1
+                                    loss_info = defaultdict(list)
+        finally:
+            self.teacher.off_load_runtime_components()
