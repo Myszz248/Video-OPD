@@ -1,0 +1,148 @@
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 4  # Match the 4 GPUs visible on the current OPD server; adjust if needed.
+main_process_port: 29500
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/vid_prompt"  # Contains train.txt / test.txt (one prompt per line)
+  preprocessing_batch_size: 16
+  dataloader_num_workers: 8
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null  # Use the full vid_prompt dataset for the long distillation run.
+  sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
+
+# Student Model Configuration
+model:
+  finetune_type: "lora"  # Options: full, lora
+  lora_rank: 64
+  lora_alpha: 128
+  target_components: "transformer"
+  target_modules: "default"
+  model_name_or_path: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+  model_type: "wan2_t2v"
+  resume_path: null
+  resume_type: null
+
+# Frozen Teacher Model Configuration
+teacher:
+  model_type: "wan2_t2v"
+  model_name_or_path: "xilanhua12138/Wan2.1-T2V-1.3B-Reward"
+  master_weight_dtype: "bfloat16"
+  target_components: []
+  runtime_components: ["text_encoders", "transformers"]
+  prompt_template: "{prompt}"
+  negative_prompt: null
+
+log:
+  run_name: null
+  project: "Flow-Factory-OPD"
+  logging_backend: "tensorboard"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"
+  # Long run: save every 10 epochs, plus a final checkpoint at training end.
+  save_freq: 10
+  save_model_only: true
+
+# Training Configuration
+train:
+  trainer_type: "opd"
+  # Long OPD distillation run for 4 x H200. With the settings below this runs
+  # 100 outer epochs, 512 unique prompts per epoch, and 16 optimizer steps per epoch.
+  max_epochs: 100
+  opd_loss_type: "velocity_mse"  # Options: velocity_mse, x0_mse
+  opd_loss_weighting: "flow_opd"  # Options: flow_opd, uniform
+  opd_teacher_weight: 1.0
+  opd_reward_weight: 0.0  # Set >0 only after adding scalar rewards below
+  opd_kl_beta: 0.0
+  ref_param_device: "cuda"  # Used only when opd_kl_beta > 0
+
+  # Empty context keys make the frozen teacher use the exact same prompt as the student.
+  # Later, set e.g. ["dense_caption", "scene_graph"] and update `teacher.prompt_template`
+  # to add teacher-only metadata back into the teacher prompt.
+  teacher_guidance_scale: 5.0
+  teacher_context_keys: []
+  teacher_context_dropout: 0.0  # Used only when teacher_context_keys is non-empty
+
+  # OPD trajectory timesteps. The teacher supervises stored student denoising
+  # states instead of re-noising the final latent.
+  num_train_timesteps: 12
+  time_sampling_strategy: "discrete"  # Trajectory options: discrete, discrete_with_init, discrete_wo_init
+  time_shift: 3.0
+  timestep_range: 0.9
+  opd_timestep_mode: "trajectory"  # Options: trajectory, forward_process
+  store_student_trajectory: true
+  # null auto-selects sparse non-final steps for Flow-OPD. Explicit indices must
+  # avoid the final denoising step because it has no positive Flow-SDE variance.
+  opd_trajectory_indices: null
+  # Optional teacher-first-step latent blending path used by first-frame teacher
+  # setups such as Wan VACE. Keep disabled for prompt-only Wan T2V OPD.
+  opd_blend_teacher_student_latents: false  # Options: true, false
+  opd_teacher_blend_weight: 0.5
+  opd_student_blend_weight: 0.5
+
+  # Student sampling settings
+  resolution: [480, 832]
+  extra_kwargs:
+    num_frames: 17
+  num_inference_steps: 24
+  guidance_scale: 5.0
+
+  # Pure OPD distillation does not need K-repeat reward groups. Spend the same
+  # compute on prompt diversity instead of repeated rollouts of the same prompt.
+  # Geometry for 4 GPUs (W=4, B=1, G=16): M*K = 512, divisible by W*B*G = 64.
+  per_device_batch_size: 1
+  group_size: 1
+  global_std: false
+  advantage_aggregation: "gdpo"  # Used only when opd_reward_weight > 0
+  unique_sample_num_per_epoch: 512
+  gradient_step_per_epoch: 16
+  gradient_accumulation_steps: auto
+
+  # Optimization
+  seed: 42
+  learning_rate: 5.0e-5
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # EMA and memory. Trajectory-mode OPD stores sparse rollout latents; CPU
+  # offload is recommended for video models.
+  ema_decay: 0.95
+  ema_update_interval: 1
+  ema_device: "cuda"
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: true
+
+# Scheduler Configuration
+scheduler:
+  # Flow-OPD-faithful rollout: stochastic on-policy states, no log-prob needed for OPD loss.
+  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+  noise_level: 0.7
+  sde_steps: null
+  num_sde_steps: null
+
+# Evaluation settings
+eval:
+  resolution: [480, 832]
+  extra_kwargs:
+    num_frames: 17
+  per_device_batch_size: 1
+  guidance_scale: 5.0
+  num_inference_steps: 30
+  # Keep built-in eval disabled because it generates the entire test split.
+  # Use ff-infer on saved checkpoints for controlled qualitative comparisons.
+  eval_freq: 0
+  seed: 42
+
+# Optional scalar rewards for reward-weighted OPD.
+# rewards:
+#   - name: "pick_score"
+#     reward_model: "PickScore"
+#     weight: 1.0
+#     batch_size: 16
+#     device: "cuda"
+#     dtype: bfloat16
