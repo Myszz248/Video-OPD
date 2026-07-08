@@ -101,13 +101,16 @@ train:
   guidance_scale: 5.0
 
   # Pure OPD distillation does not need repeated rollouts per prompt.
-  per_device_batch_size: 1
+  per_device_batch_size: 3
   group_size: 1
   global_std: false
   advantage_aggregation: "gdpo"
-  unique_sample_num_per_epoch: 576
-  gradient_step_per_epoch: 16
-  gradient_accumulation_steps: auto
+  # Fast sanity-check mode: keep exactly one global batch per epoch when using
+  # 8 ranks x per_device_batch_size(3). The config resolver will align the
+  # unique count up to the minimum valid value for one iteration.
+  unique_sample_num_per_epoch: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: 1
 
   # Optimization
   seed: 42
@@ -138,7 +141,7 @@ eval:
   extra_kwargs:
     num_frames: 41  # (num_frames - 1) must be divisible by 4
     control_hidden_states_scale: 1.0
-  per_device_batch_size: 1
+  per_device_batch_size: 3
   guidance_scale: 5.0
   num_inference_steps: 30
   eval_freq: 0

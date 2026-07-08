@@ -18,7 +18,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from accelerate import Accelerator
@@ -42,7 +42,13 @@ logger = setup_logger(__name__)
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments for teacher-resume debug."""
-    parser = argparse.ArgumentParser(description="Standalone OPD teacher-resume debug")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Standalone OPD teacher-resume debug. Student trajectory latents are generated "
+            "from text prompt only; teacher first-step latents are generated from prompt plus "
+            "teacher image context, then optionally blended before teacher resume."
+        )
+    )
     parser.add_argument("--config", type=str, required=True, help="OPD YAML config.")
     parser.add_argument("--prompt", type=str, required=True, help="Student prompt text.")
     parser.add_argument(
@@ -98,6 +104,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Override second-stage CFG scale for Wan models.",
+    )
+    parser.add_argument(
+        "--student-latent-weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to the extracted student latent before teacher resume.",
+    )
+    parser.add_argument(
+        "--teacher-first-step-weight",
+        type=float,
+        default=0.0,
+        help="Weight applied to the teacher first-step latent before teacher resume.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed.")
     parser.add_argument("--fps", type=int, default=16, help="Saved video FPS.")
@@ -171,6 +189,25 @@ def _build_teacher_context(args: argparse.Namespace) -> str:
     return OPDContextBuilder.serialize_context(context)
 
 
+def _resolve_blend_weights(args: argparse.Namespace) -> Tuple[float, float]:
+    """Resolve and validate teacher/student latent blend weights."""
+    student_weight = args.student_latent_weight
+    teacher_weight = args.teacher_first_step_weight
+    if student_weight < 0:
+        raise ValueError(
+            f"`student_latent_weight` must be non-negative, got {student_weight}."
+        )
+    if teacher_weight < 0:
+        raise ValueError(
+            f"`teacher_first_step_weight` must be non-negative, got {teacher_weight}."
+        )
+    if student_weight == 0 and teacher_weight == 0:
+        raise ValueError(
+            "At least one of `student_latent_weight` or `teacher_first_step_weight` must be positive."
+        )
+    return student_weight, teacher_weight
+
+
 def _build_student_inference_kwargs(
     args: argparse.Namespace,
     config: Arguments,
@@ -211,6 +248,78 @@ def _resolve_output_path(output: str) -> str:
     return str(output_path)
 
 
+def _build_resume_override_latents(
+    *,
+    args: argparse.Namespace,
+    teacher: Any,
+    student_sample: Any,
+    step_idx: int,
+    accelerator: Accelerator,
+) -> Optional[torch.Tensor]:
+    """Build one optional mixed latent override for teacher resume."""
+    student_weight, teacher_weight = _resolve_blend_weights(args)
+    if student_weight == 1.0 and teacher_weight == 0.0:
+        return None
+    if student_sample.prompt is None:
+        raise ValueError("Teacher-resume blend debug requires the student sample prompt.")
+    if student_sample.all_latents is None or student_sample.latent_index_map is None:
+        raise ValueError(
+            "Teacher-resume blend debug requires `all_latents` and `latent_index_map` on the student sample."
+        )
+
+    latent_index_map = student_sample.latent_index_map.to(device=accelerator.device)
+    compact_idx = int(latent_index_map[step_idx].item())
+    if compact_idx < 0:
+        raise ValueError(
+            "Requested teacher resume step was not stored in the student trajectory: "
+            f"step_idx({step_idx}), latent_index_map={latent_index_map.detach().cpu().tolist()}."
+        )
+
+    student_latents = student_sample.all_latents[compact_idx].unsqueeze(0).to(teacher.teacher_args.device)
+    if teacher_weight == 0.0:
+        return (student_weight * student_latents).detach().cpu()
+
+    context = student_sample.extra_kwargs.get("opd_context", "{}")
+    negative_prompts = (
+        [student_sample.negative_prompt] if student_sample.negative_prompt is not None else None
+    )
+    batch = {
+        "prompt": [student_sample.prompt],
+        "negative_prompt": negative_prompts,
+    }
+    reference_latents = student_sample.all_latents[0].unsqueeze(0).to(teacher.teacher_args.device)
+    teacher_generator = None
+    if args.seed is not None:
+        # Keep teacher-first-step rollout deterministic without reusing the student's consumed RNG state.
+        teacher_generator = torch.Generator(device=teacher.teacher_args.device).manual_seed(args.seed)
+
+    teacher.on_load_runtime_components()
+    try:
+        with torch.no_grad():
+            teacher_encoded = teacher.encode_prompt(
+                prompts=batch["prompt"],
+                contexts=[context],
+                negative_prompts=batch["negative_prompt"],
+                generator=teacher_generator,
+            )
+            teacher_first_step_latents = teacher.rollout_first_step_latents(
+                batch=batch,
+                contexts=[context],
+                reference_latents=reference_latents,
+                generator=teacher_generator,
+                encoded_prompt=teacher_encoded,
+            )
+    finally:
+        teacher.off_load_runtime_components()
+
+    target_dtype = student_latents.dtype
+    mixed_latents = (
+        student_weight * student_latents.to(dtype=target_dtype)
+        + teacher_weight * teacher_first_step_latents.to(dtype=target_dtype)
+    )
+    return mixed_latents.detach().cpu()
+
+
 def run_debug(args: argparse.Namespace) -> str:
     """Run standalone student-rollout -> teacher-resume debug and save one mp4."""
     config = _load_config(args)
@@ -248,9 +357,17 @@ def run_debug(args: argparse.Namespace) -> str:
         student_sample = student_adapter.inference(**inference_kwargs)[0]
 
     student_sample.extra_kwargs["opd_context"] = _build_teacher_context(args)
+    override_latents = _build_resume_override_latents(
+        args=args,
+        teacher=teacher,
+        student_sample=student_sample,
+        step_idx=trajectory_step_idx,
+        accelerator=accelerator,
+    )
     teacher_sample = teacher.resume_from_student_samples(
         samples=[student_sample],
         step_idx=trajectory_step_idx,
+        override_latents=[override_latents] if override_latents is not None else None,
     )[0]
 
     output_path = _resolve_output_path(args.output)

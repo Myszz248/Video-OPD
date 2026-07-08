@@ -495,10 +495,16 @@ class OPDTeacher:
         self,
         samples: List[BaseSample],
         step_idx: int,
+        override_latents: Optional[List[torch.Tensor]] = None,
     ) -> List[T2VSample]:
         """Resume teacher denoising from stored student states and decode debug videos."""
         if not samples:
             return []
+        if override_latents is not None and len(override_latents) != len(samples):
+            raise ValueError(
+                "`override_latents` must match `samples` length, got "
+                f"{len(override_latents)} vs {len(samples)}."
+            )
 
         self.on_load_runtime_components()
         try:
@@ -506,7 +512,7 @@ class OPDTeacher:
             resumed_samples: List[T2VSample] = []
 
             with torch.no_grad():
-                for sample in samples:
+                for sample_idx, sample in enumerate(samples):
                     if sample.prompt is None:
                         raise ValueError("Teacher resume debug requires every sample to have `prompt`.")
                     if sample.timesteps is None or sample.all_latents is None or sample.latent_index_map is None:
@@ -534,9 +540,21 @@ class OPDTeacher:
                             f"latent_index_map={latent_index_map.detach().cpu().tolist()}."
                         )
 
-                    current_latents = sample.all_latents[compact_idx].unsqueeze(0).to(
-                        self.teacher_args.device
-                    )
+                    current_latents = sample.all_latents[compact_idx].unsqueeze(0).to(self.teacher_args.device)
+                    if override_latents is not None:
+                        current_latents = override_latents[sample_idx].to(
+                            device=self.teacher_args.device,
+                            dtype=current_latents.dtype,
+                        )
+                        if current_latents.ndim == sample.all_latents[compact_idx].ndim:
+                            current_latents = current_latents.unsqueeze(0)
+                        if current_latents.shape != sample.all_latents[compact_idx].unsqueeze(0).shape:
+                            raise ValueError(
+                                "Override resume latents must match the stored student latent "
+                                "shape, got "
+                                f"{tuple(current_latents.shape)} vs "
+                                f"{tuple(sample.all_latents[compact_idx].unsqueeze(0).shape)}."
+                            )
                     context = sample.extra_kwargs.get("opd_context", "{}")
                     prompts = [sample.prompt]
                     negative_prompts = None
