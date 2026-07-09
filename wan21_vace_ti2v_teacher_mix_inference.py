@@ -143,7 +143,10 @@ def parse_args() -> argparse.Namespace:
         "--conditioning-scale",
         type=float,
         default=1.0,
-        help="Student VACE conditioning scale for the first-frame control input.",
+        help=(
+            "Compatibility flag kept for teacher default resolution. "
+            "Student now runs prompt-only and does not consume image conditioning."
+        ),
     )
     parser.add_argument(
         "--teacher-conditioning-scale",
@@ -327,6 +330,20 @@ def prepare_first_frame_vace_control(
     mask_generate = Image.new("L", (width, height), 255)
     video = [image] + [blank.copy() for _ in range(num_frames - 1)]
     mask = [mask_keep] + [mask_generate.copy() for _ in range(num_frames - 1)]
+    return video, mask
+
+
+def prepare_blank_vace_control(
+    height: int,
+    width: int,
+    num_frames: int,
+) -> tuple[List[Image.Image], List[Image.Image]]:
+    """Create prompt-only VACE control inputs matching official blank conditioning."""
+    video = [
+        Image.new("RGB", (width, height), (128, 128, 128))
+        for _ in range(num_frames)
+    ]
+    mask = [Image.new("L", (width, height), 255) for _ in range(num_frames)]
     return video, mask
 
 
@@ -678,7 +695,7 @@ def collect_student_target_step_latent(
     num_inference_steps: int,
     target_step_index: int,
     guidance_scale: float,
-    conditioning_scale: float,
+    conditioning_scale: Optional[float],
     latents: torch.Tensor,
 ) -> torch.Tensor:
     """Run student inference and store only the requested post-step latent on CPU."""
@@ -697,23 +714,26 @@ def collect_student_target_step_latent(
             callback_pipe._interrupt = True
         return callback_kwargs
 
+    inference_kwargs: Dict[str, Any] = {
+        "video": video,
+        "mask": mask,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "height": height,
+        "width": width,
+        "num_frames": num_frames,
+        "num_inference_steps": num_inference_steps,
+        "guidance_scale": guidance_scale,
+        "latents": latents.clone(),
+        "output_type": "latent",
+        "callback_on_step_end": capture_callback,
+        "callback_on_step_end_tensor_inputs": ["latents"],
+    }
+    if conditioning_scale is not None:
+        inference_kwargs["conditioning_scale"] = conditioning_scale
+
     with torch.no_grad():
-        pipe(
-            video=video,
-            mask=mask,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            conditioning_scale=conditioning_scale,
-            latents=latents.clone(),
-            output_type="latent",
-            callback_on_step_end=capture_callback,
-            callback_on_step_end_tensor_inputs=["latents"],
-        )
+        pipe(**inference_kwargs)
     pipe._interrupt = False
 
     if target_latent is None:
@@ -750,7 +770,8 @@ def build_metadata(
             ),
             "resolved_lora_path": student_lora_path,
             "guidance_scale": args.guidance_scale,
-            "conditioning_scale": args.conditioning_scale,
+            "conditioning_mode": "prompt_only_blank_vace_control",
+            "conditioning_scale": None,
             "flow_shift": args.flow_shift,
             "dtype": args.dtype,
         },
@@ -762,6 +783,7 @@ def build_metadata(
                 else None
             ),
             "resolved_lora_path": teacher_lora_path,
+            "conditioning_mode": "first_frame_image",
             "guidance_scale": resolved_teacher_guidance_scale,
             "conditioning_scale": resolved_teacher_conditioning_scale,
             "flow_shift": resolved_teacher_flow_shift,
@@ -854,17 +876,22 @@ def main() -> None:
     )
 
     with Image.open(image_path) as input_image:
-        video, mask = prepare_first_frame_vace_control(
+        teacher_video, teacher_mask = prepare_first_frame_vace_control(
             input_image,
             height=args.height,
             width=args.width,
             num_frames=effective_num_frames,
         )
+    student_video, student_mask = prepare_blank_vace_control(
+        height=args.height,
+        width=args.width,
+        num_frames=effective_num_frames,
+    )
 
     student_target_step_latent = collect_student_target_step_latent(
         student_pipe,
-        video=video,
-        mask=mask,
+        video=student_video,
+        mask=student_mask,
         prompt=args.prompt,
         negative_prompt=negative_prompt,
         height=args.height,
@@ -873,7 +900,7 @@ def main() -> None:
         num_inference_steps=args.num_inference_steps,
         target_step_index=normalized_mix_step_index,
         guidance_scale=args.guidance_scale,
-        conditioning_scale=args.conditioning_scale,
+        conditioning_scale=None,
         latents=shared_initial_latents,
     )
 
@@ -892,8 +919,8 @@ def main() -> None:
     teacher_first_step_latent = capture_teacher_first_step_latent(
         teacher_pipe,
         initial_latents=shared_initial_latents.clone(),
-        video=video,
-        mask=mask,
+        video=teacher_video,
+        mask=teacher_mask,
         prompt=args.prompt,
         negative_prompt=negative_prompt,
         height=args.height,
@@ -918,8 +945,8 @@ def main() -> None:
     frames = continue_teacher_from_mixed_latents(
         teacher_pipe,
         mixed_latents=mixed_latents,
-        video=video,
-        mask=mask,
+        video=teacher_video,
+        mask=teacher_mask,
         prompt=args.prompt,
         negative_prompt=negative_prompt,
         height=args.height,

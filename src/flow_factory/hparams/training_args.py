@@ -1073,9 +1073,10 @@ class OPDTrainingArguments(TrainingArguments):
         default=False,
         metadata={
             "help": (
-                "If true, run the frozen teacher for one rollout step during sample(), store "
-                "that latent, then supervise each selected student trajectory state with teacher "
-                "predictions evaluated on the weighted latent blend."
+                "If true, run the frozen teacher for one rollout step during sample() from the "
+                "student's exact initial rollout noise, store that latent, then supervise each "
+                "selected student trajectory state with teacher predictions evaluated on the "
+                "weighted latent blend."
             )
         },
     )
@@ -1097,6 +1098,7 @@ class OPDTrainingArguments(TrainingArguments):
             )
         },
     )
+
     def __post_init__(self):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)

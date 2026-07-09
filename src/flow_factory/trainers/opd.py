@@ -437,7 +437,7 @@ class OPDTrainer(BaseTrainer):
         samples: List[BaseSample],
         generator: Optional[torch.Generator],
     ) -> None:
-        """Run one teacher rollout step and store the resulting latents on each sample."""
+        """Run one teacher rollout step from the student's stored initial noise."""
         if not self.use_teacher_student_latent_blend:
             return
         if not samples:
@@ -449,15 +449,15 @@ class OPDTrainer(BaseTrainer):
                 "Teacher first-step latent blending requires every sample to carry a prompt."
             )
         contexts = [sample.extra_kwargs.get("opd_context", "{}") for sample in samples]
-        reference_latents = []
+        student_initial_latents = []
         for sample in samples:
             if sample.all_latents is None:
                 raise ValueError(
                     "Teacher first-step latent blending requires stored student trajectory "
                     "latents on every sample."
                 )
-            reference_latents.append(sample.all_latents[0])
-        reference_latents_batch = torch.stack(reference_latents, dim=0)
+            student_initial_latents.append(sample.all_latents[0])
+        student_initial_latents_batch = torch.stack(student_initial_latents, dim=0)
         negative_prompts = [sample.negative_prompt for sample in samples]
         batch = {
             "prompt": prompts,
@@ -475,7 +475,7 @@ class OPDTrainer(BaseTrainer):
             teacher_first_step_latents = self.teacher.rollout_first_step_latents(
                 batch=batch,
                 contexts=contexts,
-                reference_latents=reference_latents_batch,
+                student_initial_latents=student_initial_latents_batch,
                 generator=generator,
                 encoded_prompt=teacher_encoded,
             ).detach().cpu()
@@ -780,13 +780,7 @@ class OPDTrainer(BaseTrainer):
                 f"teacher={tuple(teacher_first_step_latents.shape)}."
             )
 
-        teacher_weight = torch.as_tensor(
-            self.training_args.opd_teacher_blend_weight,
-            device=student_latents.device,
-            dtype=student_latents.dtype,
-        )
-        student_weight = torch.as_tensor(
-            self.training_args.opd_student_blend_weight,
+        teacher_weight, student_weight = self._resolve_teacher_student_blend_weights(
             device=student_latents.device,
             dtype=student_latents.dtype,
         )
@@ -795,6 +789,24 @@ class OPDTrainer(BaseTrainer):
             dtype=student_latents.dtype,
         )
         return teacher_weight * teacher_latents + student_weight * student_latents
+
+    def _resolve_teacher_student_blend_weights(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the effective teacher/student latent blend weights."""
+        teacher_weight = torch.as_tensor(
+            self.training_args.opd_teacher_blend_weight,
+            device=device,
+            dtype=dtype,
+        )
+        student_weight = torch.as_tensor(
+            self.training_args.opd_student_blend_weight,
+            device=device,
+            dtype=dtype,
+        )
+        return teacher_weight, student_weight
 
     def _get_batch_trajectory_step_indices(
         self,

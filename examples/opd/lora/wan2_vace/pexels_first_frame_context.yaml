@@ -86,8 +86,8 @@ train:
   # 24-step student rollout. They are the only student trajectory states kept.
   opd_trajectory_indices: [4, 12, 20]
   # Additionally, run the teacher for one denoising step from prompt + first-frame
-  # context, then blend that latent with each stored student state before teacher
-  # supervision.
+  # context while reusing the student's exact initial rollout noise, then blend
+  # that latent with each stored student state before teacher supervision.
   opd_blend_teacher_student_latents: true  # Options: true, false
   opd_teacher_blend_weight: 0.5
   opd_student_blend_weight: 0.5

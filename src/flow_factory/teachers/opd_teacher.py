@@ -304,38 +304,17 @@ class OPDTeacher:
 
     def _prepare_rollout_initial_latents(
         self,
-        reference_latents: torch.Tensor,
-        generator: Optional[torch.Generator],
+        student_initial_latents: torch.Tensor,
     ) -> torch.Tensor:
-        """Prepare one batch of teacher rollout latents matching a reference latent shape."""
-        if reference_latents.ndim != 5:
+        """Move the stored student rollout noise to the teacher device for step-1 replay."""
+        if student_initial_latents.ndim != 5:
             raise ValueError(
                 "Teacher first-step rollout expects video latents with shape (B, C, T, H, W), "
-                f"got {tuple(reference_latents.shape)}."
+                f"got {tuple(student_initial_latents.shape)}."
             )
-        if not hasattr(self.adapter.pipeline, "prepare_latents"):
-            raise ValueError(
-                f"Teacher adapter {type(self.adapter).__name__} has no `pipeline.prepare_latents()` "
-                "method required for first-step latent rollout."
-            )
-
-        geometry = self._latent_geometry(reference_latents)
-        prepare_latent_kwargs = {
-            "batch_size": geometry["batch_size"],
-            "num_channels_latents": geometry["num_channels_latents"],
-            "height": geometry["height"],
-            "width": geometry["width"],
-            "num_frames": geometry["num_frames"],
-            "dtype": torch.float32,
-            "device": self.teacher_args.device,
-            "generator": generator,
-        }
-        prepare_latent_kwargs = filter_kwargs(
-            self.adapter.pipeline.prepare_latents,
-            **prepare_latent_kwargs,
+        return self.adapter.cast_latents(
+            student_initial_latents.to(device=self.teacher_args.device)
         )
-        initial_latents = self.adapter.pipeline.prepare_latents(**prepare_latent_kwargs)
-        return self.adapter.cast_latents(initial_latents.to(self.teacher_args.device))
 
     def _forward_output(
         self,
@@ -425,11 +404,11 @@ class OPDTeacher:
         self,
         batch: Dict[str, Any],
         contexts: List[Any],
-        reference_latents: torch.Tensor,
+        student_initial_latents: torch.Tensor,
         generator: Optional[torch.Generator] = None,
         encoded_prompt: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Run exactly one teacher denoising step and return the resulting latent batch."""
+        """Run one teacher denoising step from the student's exact initial rollout noise."""
         num_inference_steps = self.training_args.num_inference_steps
         if num_inference_steps < 2:
             raise ValueError(
@@ -441,8 +420,7 @@ class OPDTeacher:
         self.adapter.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.adapter.scheduler.timesteps
         initial_latents = self._prepare_rollout_initial_latents(
-            reference_latents=reference_latents,
-            generator=generator,
+            student_initial_latents=student_initial_latents,
         )
         media_forward_kwargs = self.prepare_media_forward_kwargs(
             contexts=contexts,

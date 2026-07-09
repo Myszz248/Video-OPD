@@ -145,6 +145,7 @@ def _load_config(args: argparse.Namespace) -> Arguments:
     """Load config and apply standalone debug overrides."""
     config = Arguments.load_from_yaml(args.config)
     config.log_args.logging_backend = "none"
+    config.training_args.latent_storage_dtype = "fp32"
 
     if args.mixed_precision is not None:
         config.mixed_precision = args.mixed_precision
@@ -287,7 +288,9 @@ def _build_resume_override_latents(
         "prompt": [student_sample.prompt],
         "negative_prompt": negative_prompts,
     }
-    reference_latents = student_sample.all_latents[0].unsqueeze(0).to(teacher.teacher_args.device)
+    student_initial_latents = student_sample.all_latents[0].unsqueeze(0).to(
+        teacher.teacher_args.device
+    )
     teacher_generator = None
     if args.seed is not None:
         # Keep teacher-first-step rollout deterministic without reusing the student's consumed RNG state.
@@ -305,7 +308,7 @@ def _build_resume_override_latents(
             teacher_first_step_latents = teacher.rollout_first_step_latents(
                 batch=batch,
                 contexts=[context],
-                reference_latents=reference_latents,
+                student_initial_latents=student_initial_latents,
                 generator=teacher_generator,
                 encoded_prompt=teacher_encoded,
             )
